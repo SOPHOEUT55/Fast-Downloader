@@ -1,0 +1,6 @@
+{
+  "name": "OmniSave - Universal Social Media Downloader",
+  "description": "Fast, seamless video and image downloader for Instagram, TikTok, YouTube, X/Twitter, Facebook, Pinterest, and Reddit with 4K/HD quality, audio extraction, and batch downloading.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
