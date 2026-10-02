@@ -58,6 +58,14 @@ export interface MediaItem {
     shares?: number;
   };
   watermarkRemoved: boolean;
+  embedUrl?: string;
+  directSourceUrl?: string;
+  previewVideoUrl?: string;
+  realDownloadGateways?: {
+    name: string;
+    url: string;
+    guide: string;
+  }[];
   resolvedAt: string;
 }
 

@@ -3,14 +3,66 @@ import { detectPlatformFromUrl, PLATFORMS } from './platforms';
 
 // Client-side fallback generation when server is unreachable or offline
 function generateFallbackMediaItem(url: string, removeWatermark: boolean): MediaItem {
-  const platform = detectPlatformFromUrl(url);
+  const trimmed = url.trim();
+  const platform = detectPlatformFromUrl(trimmed);
   const platformConfig = PLATFORMS[platform];
-  const isVertical = platform === 'tiktok' || platform === 'threads' || url.includes('reel') || url.includes('short');
+  const isVertical = platform === 'tiktok' || platform === 'threads' || trimmed.includes('reel') || trimmed.includes('short');
 
-  const natureThumb = '/media/nature.jpg';
-  const fashionThumb = '/media/street.jpg';
+  let title = 'Extracted Media Video';
+  let author = { name: platformConfig.name + ' Creator', handle: `@${platform}_creator` };
+  let thumbnail = isVertical ? '/media/street.jpg' : '/media/nature.jpg';
+  let embedUrl: string | undefined = undefined;
+  let directSourceUrl: string | undefined = undefined;
 
-  const selectedThumb = isVertical ? fashionThumb : natureThumb;
+  // Check direct media
+  const directMatch = trimmed.match(/\.(mp4|webm|m4v|mov|mp3|wav|jpg|jpeg|png|webp)(\?|$)/i);
+  if (directMatch) {
+    const ext = directMatch[1].toLowerCase();
+    try {
+      const pathname = new URL(trimmed).pathname;
+      const base = pathname.split('/').pop();
+      if (base) title = decodeURIComponent(base).replace(/\.[^/.]+$/, '').replace(/[-_]/g, ' ');
+    } catch {
+      title = 'Direct Media Stream';
+    }
+    directSourceUrl = trimmed;
+  } else if (platform === 'youtube') {
+    const ytMatch = trimmed.match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/|v\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/i);
+    if (ytMatch) {
+      const videoId = ytMatch[1];
+      title = `YouTube Video (${videoId})`;
+      thumbnail = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+      embedUrl = `https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&rel=0`;
+      author = { name: 'YouTube Channel', handle: '@youtube' };
+    }
+  } else if (platform === 'tiktok') {
+    const userMatch = trimmed.match(/@([a-zA-Z0-9_.-]+)/i);
+    const idMatch = trimmed.match(/\/video\/(\d+)/i);
+    const username = userMatch ? userMatch[1] : 'creator';
+    title = `TikTok Video by @${username}`;
+    author = { name: username, handle: `@${username}` };
+    if (idMatch) embedUrl = `https://www.tiktok.com/embed/v2/${idMatch[1]}`;
+  } else if (platform === 'instagram' || platform === 'threads') {
+    const reelMatch = trimmed.match(/\/(?:reel|p|tv)\/([a-zA-Z0-9_-]+)/i);
+    const shortcode = reelMatch ? reelMatch[1] : null;
+    title = shortcode ? `Instagram Reel (${shortcode})` : 'Instagram Creator Reel';
+    if (shortcode) embedUrl = `https://www.instagram.com/p/${shortcode}/embed/captioned/`;
+  } else if (platform === 'reddit') {
+    const rMatch = trimmed.match(/reddit\.com\/r\/([a-zA-Z0-9_]+)\/comments\/([a-zA-Z0-9]+)(?:\/([a-zA-Z0-9_]+))?/i);
+    if (rMatch && rMatch[3]) {
+      title = rMatch[3].replace(/_/g, ' ');
+      title = title.charAt(0).toUpperCase() + title.slice(1);
+    }
+    author = { name: rMatch ? `r/${rMatch[1]}` : 'Reddit', handle: '@reddit' };
+  } else if (platform === 'twitter') {
+    const xMatch = trimmed.match(/(?:twitter\.com|x\.com)\/([a-zA-Z0-9_]+)\/status\/(\d+)/i);
+    const username = xMatch ? xMatch[1] : 'x_user';
+    title = `X Media Post by @${username}`;
+    author = { name: username, handle: `@${username}` };
+    if (xMatch && xMatch[2]) embedUrl = `https://platform.twitter.com/embed/Tweet.html?id=${xMatch[2]}`;
+  }
+
+  const safeTitleSlug = title.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 24);
   const video4kFile = 'nature_4k.mp4';
   const video1080pFile = isVertical ? 'street_1080p.mp4' : 'nature_1080p.mp4';
   const video720pFile = 'nature_720p.mp4';
@@ -18,32 +70,25 @@ function generateFallbackMediaItem(url: string, removeWatermark: boolean): Media
   const audioFile = isVertical ? 'audio_street.mp3' : 'audio_sample.mp3';
   const imageFile = isVertical ? 'street.jpg' : 'nature.jpg';
 
-  const title = isVertical
-    ? `Shinjuku Street Aesthetic: Cyberpunk Creator Series`
-    : `Ultra 4K Aerial Expedition: Alpine Vista & Glacial Lakes`;
-
-  const safeTitleSlug = title.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 24);
-
-  const author = isVertical
-    ? { name: 'Kenji Shibuya', handle: '@kenjiofficial' }
-    : { name: 'Terra Vision', handle: '@terravision_films' };
-
   return {
     id: 'media_' + Date.now().toString(36),
-    url,
+    url: trimmed,
     platform,
     platformName: platformConfig.name,
     title,
     author,
-    thumbnail: selectedThumb,
+    thumbnail,
     duration: isVertical ? 24 : 38,
     durationFormatted: isVertical ? '00:24' : '00:38',
     mediaType: platform === 'pinterest' ? 'carousel' : 'video',
+    embedUrl,
+    directSourceUrl,
+    previewVideoUrl: directSourceUrl || `/media/${video1080pFile}`,
     carouselItems: platform === 'pinterest' ? [
       {
         id: 'c1',
         type: 'image',
-        previewUrl: natureThumb,
+        previewUrl: '/media/nature.jpg',
         downloadUrl: `/api/download-file?file=nature.jpg&filename=slide_01.jpg`,
         width: 1920,
         height: 1080
@@ -51,7 +96,7 @@ function generateFallbackMediaItem(url: string, removeWatermark: boolean): Media
       {
         id: 'c2',
         type: 'image',
-        previewUrl: fashionThumb,
+        previewUrl: '/media/street.jpg',
         downloadUrl: `/api/download-file?file=street.jpg&filename=slide_02.jpg`,
         width: 1080,
         height: 1920
@@ -69,7 +114,7 @@ function generateFallbackMediaItem(url: string, removeWatermark: boolean): Media
         fps: 60,
         hasAudio: true,
         bitrate: '18 Mbps',
-        downloadUrl: `/api/download-file?file=${video4kFile}&filename=OmniSave_4K_${safeTitleSlug}.mp4`
+        downloadUrl: `/api/stream-download?url=${encodeURIComponent(trimmed)}&format=2160p&filename=${encodeURIComponent(`OmniSave_4K_${safeTitleSlug}.mp4`)}`
       },
       {
         id: '1080p',
@@ -82,12 +127,12 @@ function generateFallbackMediaItem(url: string, removeWatermark: boolean): Media
         fps: 60,
         hasAudio: true,
         bitrate: '8 Mbps',
-        downloadUrl: `/api/download-file?file=${video1080pFile}&filename=OmniSave_1080p_${safeTitleSlug}.mp4`
+        downloadUrl: `/api/stream-download?url=${encodeURIComponent(trimmed)}&format=1080p&filename=${encodeURIComponent(`OmniSave_1080p_${safeTitleSlug}.mp4`)}`
       },
       {
         id: '720p',
         quality: '720p HD',
-        resolution: '1280x720',
+        resolution: isVertical ? '720x1280' : '1280x720',
         format: 'mp4',
         type: 'video',
         sizeBytes: 514000,
@@ -95,12 +140,12 @@ function generateFallbackMediaItem(url: string, removeWatermark: boolean): Media
         fps: 30,
         hasAudio: true,
         bitrate: '4 Mbps',
-        downloadUrl: `/api/download-file?file=${video720pFile}&filename=OmniSave_720p_${safeTitleSlug}.mp4`
+        downloadUrl: `/api/stream-download?url=${encodeURIComponent(trimmed)}&format=720p&filename=${encodeURIComponent(`OmniSave_720p_${safeTitleSlug}.mp4`)}`
       },
       {
         id: '480p',
         quality: '480p SD',
-        resolution: '854x480',
+        resolution: isVertical ? '480x854' : '854x480',
         format: 'mp4',
         type: 'video',
         sizeBytes: 263000,
@@ -108,7 +153,7 @@ function generateFallbackMediaItem(url: string, removeWatermark: boolean): Media
         fps: 30,
         hasAudio: true,
         bitrate: '2 Mbps',
-        downloadUrl: `/api/download-file?file=${video480pFile}&filename=OmniSave_480p_${safeTitleSlug}.mp4`
+        downloadUrl: `/api/stream-download?url=${encodeURIComponent(trimmed)}&format=480p&filename=${encodeURIComponent(`OmniSave_480p_${safeTitleSlug}.mp4`)}`
       },
       {
         id: 'audio-mp3',
@@ -120,7 +165,7 @@ function generateFallbackMediaItem(url: string, removeWatermark: boolean): Media
         sizeFormatted: '202 KB',
         hasAudio: true,
         bitrate: '320 kbps',
-        downloadUrl: `/api/download-file?file=${audioFile}&filename=OmniSave_Audio_${safeTitleSlug}.mp3`
+        downloadUrl: `/api/stream-download?url=${encodeURIComponent(trimmed)}&format=audio-mp3&filename=${encodeURIComponent(`OmniSave_Audio_${safeTitleSlug}.mp3`)}`
       },
       {
         id: 'thumb-hd',
@@ -131,11 +176,11 @@ function generateFallbackMediaItem(url: string, removeWatermark: boolean): Media
         sizeBytes: 813000,
         sizeFormatted: '813 KB',
         hasAudio: false,
-        downloadUrl: `/api/download-file?file=${imageFile}&filename=OmniSave_Cover_${safeTitleSlug}.jpg`
+        downloadUrl: `/api/stream-download?url=${encodeURIComponent(trimmed)}&format=thumb-hd&filename=${encodeURIComponent(`OmniSave_Cover_${safeTitleSlug}.jpg`)}`
       }
     ],
-    caption: `Full resolution master download for ${url}. Clean source render with watermark removal set to ${removeWatermark ? 'Enabled' : 'Disabled'}.`,
-    tags: [platform, 'omnisave', '4k', 'media'],
+    caption: `Full resolution master download for ${title}. Clean source render.`,
+    tags: [platform, 'omnisave', 'media'],
     stats: {
       likes: 194200,
       views: 1250000,
@@ -143,6 +188,10 @@ function generateFallbackMediaItem(url: string, removeWatermark: boolean): Media
       shares: 31200
     },
     watermarkRemoved: removeWatermark,
+    realDownloadGateways: [
+      { name: 'Direct High-Speed Gateway', url: `https://9xbuddy.com/process?url=${encodeURIComponent(trimmed)}`, guide: 'Instant original stream download' },
+      { name: 'Universal Web Downloader', url: `https://en.savefrom.net/1-youtube-video-downloader-4/?url=${encodeURIComponent(trimmed)}`, guide: 'Download source video file' }
+    ],
     resolvedAt: new Date().toISOString()
   };
 }

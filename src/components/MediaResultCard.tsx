@@ -49,6 +49,7 @@ export const MediaResultCard: React.FC<MediaResultCardProps> = ({
   const [downloadingFormatId, setDownloadingFormatId] = useState<string | null>(null);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [zipProgress, setZipProgress] = useState<string | null>(null);
+  const [showEmbedPlayer, setShowEmbedPlayer] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const platformInfo = PLATFORMS[item.platform];
@@ -240,24 +241,59 @@ export const MediaResultCard: React.FC<MediaResultCardProps> = ({
                     </>
                   )}
                 </div>
+              ) : showEmbedPlayer && item.embedUrl ? (
+                // Real Live Interactive Platform Embed Player
+                <div className="relative w-full h-full">
+                  <iframe
+                    src={item.embedUrl}
+                    title={item.title}
+                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                    allowFullScreen
+                    className="w-full h-full border-0 rounded-xl bg-black"
+                  />
+                  <button
+                    onClick={() => setShowEmbedPlayer(false)}
+                    className="absolute top-2 right-2 rounded-md bg-black/80 px-2 py-1 text-[11px] font-medium text-white hover:bg-black/95 transition-colors shadow-md z-20"
+                  >
+                    Close Player
+                  </button>
+                </div>
               ) : (
                 // Interactive Video Player
                 <div className="relative w-full h-full group flex items-center justify-center">
                   <video
                     ref={videoRef}
-                    src={item.formats[0]?.downloadUrl}
+                    src={item.previewVideoUrl || '/media/nature_1080p.mp4'}
                     poster={item.thumbnail}
                     playsInline
                     loop
+                    controls={false}
                     className="max-h-full max-w-full object-contain"
                     onPlay={() => setIsPlaying(true)}
                     onPause={() => setIsPlaying(false)}
                   />
 
+                  {/* Toggle button to open real embed player if available */}
+                  {item.embedUrl && (
+                    <button
+                      onClick={() => setShowEmbedPlayer(true)}
+                      className="absolute top-2.5 left-2.5 z-10 inline-flex items-center gap-1.5 rounded-lg bg-black/80 backdrop-blur-xs border border-white/10 px-2.5 py-1 text-[11px] font-semibold text-slate-200 hover:bg-indigo-600 hover:text-white transition-all shadow-md"
+                    >
+                      <Play className="h-3 w-3 fill-current" />
+                      <span>Play Source Video</span>
+                    </button>
+                  )}
+
                   {/* Center Overlay Play Button */}
                   {!isPlaying && (
                     <button
-                      onClick={togglePlay}
+                      onClick={() => {
+                        if (item.embedUrl) {
+                          setShowEmbedPlayer(true);
+                        } else {
+                          togglePlay();
+                        }
+                      }}
                       className="absolute inset-0 flex items-center justify-center bg-black/30 group-hover:bg-black/40 transition-colors"
                       aria-label="Play video"
                     >
