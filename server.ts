@@ -10,7 +10,11 @@ import util from 'util';
 const execFileAsync = util.promisify(execFile);
 let youtubeCookiesTempDir: string | undefined;
 
-function getCookiesFile(fileEnvName: string, base64EnvName?: string): string | undefined {
+function getCookiesFile(
+  fileEnvName: string,
+  base64EnvName?: string,
+  contentsEnvName?: string
+): string | undefined {
   const configuredPath = process.env[fileEnvName];
   if (configuredPath) {
     if (!fs.existsSync(configuredPath)) {
@@ -20,11 +24,15 @@ function getCookiesFile(fileEnvName: string, base64EnvName?: string): string | u
   }
 
   const encodedCookies = base64EnvName ? process.env[base64EnvName] : undefined;
-  if (!encodedCookies) return undefined;
+  const rawCookies = contentsEnvName ? process.env[contentsEnvName] : undefined;
+  if (!encodedCookies && !rawCookies) return undefined;
 
-  const cookies = Buffer.from(encodedCookies, 'base64');
-  if (!cookies.length) {
-    throw new Error(`${base64EnvName} does not contain valid cookie data.`);
+  const cookies = rawCookies
+    ? Buffer.from(rawCookies.replace(/\\n/g, '\n'), 'utf8')
+    : Buffer.from(encodedCookies!.replace(/\s/g, ''), 'base64');
+  if (!cookies.length || !cookies.toString('utf8').includes('Netscape HTTP Cookie File')) {
+    const variableName = rawCookies ? contentsEnvName : base64EnvName;
+    throw new Error(`${variableName} must contain a Netscape-format YouTube cookies.txt export.`);
   }
 
   youtubeCookiesTempDir ??= fs.mkdtempSync(path.join(os.tmpdir(), 'fast-downloader-youtube-'));
@@ -77,6 +85,14 @@ async function runYtDlp(args: string[], timeout = 60000): Promise<{ stdout: stri
     if (/python was not found|not recognized as an internal or external command/i.test(`${error.message || ''} ${stderr}`)) {
       throw new Error('Python 3.10+ is required to run the bundled yt-dlp script. Install Python, or set YTDLP_BIN to a yt-dlp.exe file. Install FFmpeg and add it to PATH for merged video/audio and MP3 output.');
     }
+    if (/sign in to confirm|confirm you.re not a bot/i.test(stderr)) {
+      const hasYoutubeCookies = Boolean(
+        process.env.YOUTUBE_COOKIES_FILE || process.env.YOUTUBE_COOKIES_B64 || process.env.YOUTUBE_COOKIES
+      );
+      throw new Error(hasYoutubeCookies
+        ? 'YouTube rejected the configured cookies. Export a fresh Netscape-format cookies.txt from a signed-in browser account, update YOUTUBE_COOKIES_B64 (or YOUTUBE_COOKIES_FILE) in Railway Variables, then redeploy.'
+        : 'YouTube is blocking requests from this server. Configure YOUTUBE_COOKIES_B64 in Railway Variables with a Base64-encoded Netscape-format cookies.txt exported from a signed-in browser, then redeploy.');
+    }
     if (error.code === 'ENOENT') {
       throw new Error(`Cannot start yt-dlp (${command}). Install Python or set YTDLP_BIN to yt-dlp.exe. ${process.env.FFMPEG_LOCATION ? '' : 'Install FFmpeg and add it to PATH for merged video/audio and MP3 output.'}`.trim());
     }
@@ -115,7 +131,7 @@ function getPlatformYtDlpArgs(url: string): string[] {
   }
 
   if (isYouTube) {
-    const cookiesFile = getCookiesFile('YOUTUBE_COOKIES_FILE', 'YOUTUBE_COOKIES_B64');
+    const cookiesFile = getCookiesFile('YOUTUBE_COOKIES_FILE', 'YOUTUBE_COOKIES_B64', 'YOUTUBE_COOKIES');
     if (cookiesFile) args.push('--cookies', cookiesFile);
   }
 
