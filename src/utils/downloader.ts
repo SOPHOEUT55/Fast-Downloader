@@ -62,7 +62,8 @@ export async function triggerFileDownload(
   try {
     const response = await fetch(downloadUrl);
     if (!response.ok) {
-      throw new Error(`Download failed with status: ${response.status}`);
+      const detail = (await response.text()).trim();
+      throw new Error(detail || `Download failed with status: ${response.status}`);
     }
 
     // Verify response is not an HTML error page!
@@ -108,16 +109,8 @@ export async function triggerFileDownload(
     setTimeout(() => URL.revokeObjectURL(blobUrl), 8000);
     if (onProgress) onProgress(100);
   } catch (err) {
-    console.warn('Direct blob fetch failed, falling back to direct anchor trigger:', err);
-    // Direct anchor fallback with download attribute
-    const link = document.createElement('a');
-    link.style.display = 'none';
-    link.href = downloadUrl;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    if (onProgress) onProgress(100);
+    console.error('Media download failed:', err);
+    throw err;
   }
 }
 

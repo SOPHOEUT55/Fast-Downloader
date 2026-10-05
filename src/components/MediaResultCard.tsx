@@ -48,6 +48,7 @@ export const MediaResultCard: React.FC<MediaResultCardProps> = ({
   const [expandedCaption, setExpandedCaption] = useState(false);
   const [downloadingFormatId, setDownloadingFormatId] = useState<string | null>(null);
   const [downloadProgress, setDownloadProgress] = useState(0);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const [zipProgress, setZipProgress] = useState<string | null>(null);
   const [showEmbedPlayer, setShowEmbedPlayer] = useState(false);
 
@@ -109,6 +110,7 @@ export const MediaResultCard: React.FC<MediaResultCardProps> = ({
   // Perform single download
   const handleDownload = async (format: MediaFormat) => {
     try {
+      setDownloadError(null);
       setDownloadingFormatId(format.id);
       setDownloadProgress(20);
 
@@ -122,6 +124,7 @@ export const MediaResultCard: React.FC<MediaResultCardProps> = ({
       if (onDownloadCompleted) onDownloadCompleted();
     } catch (err) {
       console.error('Download error:', err);
+      setDownloadError(err instanceof Error ? err.message : 'The video could not be downloaded.');
     } finally {
       setTimeout(() => {
         setDownloadingFormatId(null);
@@ -263,7 +266,7 @@ export const MediaResultCard: React.FC<MediaResultCardProps> = ({
                 <div className="relative w-full h-full group flex items-center justify-center">
                   <video
                     ref={videoRef}
-                    src={item.previewVideoUrl || '/media/nature_1080p.mp4'}
+                    src={item.previewVideoUrl}
                     poster={item.thumbnail}
                     playsInline
                     loop
@@ -489,6 +492,11 @@ export const MediaResultCard: React.FC<MediaResultCardProps> = ({
               </div>
 
               {/* Formats Table */}
+              {downloadError && (
+                <div role="alert" className="mt-4 rounded-lg border border-rose-500/30 bg-rose-950/40 px-3 py-2 text-sm text-rose-200">
+                  Download failed: {downloadError}
+                </div>
+              )}
               <div className="mt-4 space-y-2">
                 {activeTab === 'video' && (
                   <>

@@ -1,12 +1,102 @@
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { execFile } from 'child_process';
 import util from 'util';
 
 const execFileAsync = util.promisify(execFile);
+
+function getYtDlpCommand(): { command: string; prefixArgs: string[] } {
+  const configuredPath = process.env.YTDLP_BIN;
+  if (configuredPath) {
+    if (!fs.existsSync(configuredPath)) {
+      throw new Error(`YTDLP_BIN points to a missing file: ${configuredPath}`);
+    }
+    return { command: configuredPath, prefixArgs: [] };
+  }
+
+  const nativePath = path.join(__dirname, 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+  if (fs.existsSync(nativePath) && (process.platform !== 'win32' || nativePath.endsWith('.exe'))) {
+    return { command: nativePath, prefixArgs: [] };
+  }
+
+  const bundledScript = path.join(__dirname, 'bin', 'yt-dlp');
+  if (fs.existsSync(bundledScript)) {
+    if (process.platform === 'win32') {
+      return { command: process.env.PYTHON || 'python', prefixArgs: [bundledScript] };
+    }
+    return { command: process.env.PYTHON || 'python3', prefixArgs: [bundledScript] };
+  }
+
+  throw new Error('yt-dlp is not installed. Set YTDLP_BIN to its executable path.');
+}
+
+async function runYtDlp(args: string[], timeout = 60000): Promise<{ stdout: string; stderr: string }> {
+  const { command, prefixArgs } = getYtDlpCommand();
+  const ffmpegLocation = process.env.FFMPEG_LOCATION;
+  const commandArgs = ffmpegLocation
+    ? [...prefixArgs, '--ffmpeg-location', ffmpegLocation, ...args]
+    : [...prefixArgs, ...args];
+
+  try {
+    return await execFileAsync(command, commandArgs, { timeout, maxBuffer: 32 * 1024 * 1024 });
+  } catch (error: any) {
+    const stderr = String(error.stderr || '').trim();
+    const detail = stderr.split(/\r?\n/).filter(Boolean).slice(-3).join(' ');
+    if (/python was not found|not recognized as an internal or external command/i.test(`${error.message || ''} ${stderr}`)) {
+      throw new Error('Python 3.10+ is required to run the bundled yt-dlp script. Install Python, or set YTDLP_BIN to a yt-dlp.exe file. Install FFmpeg and add it to PATH for merged video/audio and MP3 output.');
+    }
+    if (error.code === 'ENOENT') {
+      throw new Error(`Cannot start yt-dlp (${command}). Install Python or set YTDLP_BIN to yt-dlp.exe. ${process.env.FFMPEG_LOCATION ? '' : 'Install FFmpeg and add it to PATH for merged video/audio and MP3 output.'}`.trim());
+    }
+    throw new Error(detail || error.message || 'yt-dlp could not extract this media.');
+  }
+}
+
+async function getYtDlpInfo(url: string): Promise<any> {
+  const { stdout } = await runYtDlp([
+    '--dump-single-json', '--no-warnings', '--no-playlist', '--skip-download',
+    ...getPlatformYtDlpArgs(url), url
+  ]);
+  try {
+    return JSON.parse(stdout);
+  } catch {
+    throw new Error('yt-dlp returned invalid media metadata.');
+  }
+}
+
+function getPlatformYtDlpArgs(url: string): string[] {
+  let isTikTok = false;
+  try {
+    isTikTok = new URL(url).hostname.toLowerCase().endsWith('tiktok.com');
+  } catch {
+    return [];
+  }
+  if (!isTikTok) return [];
+
+  const args = ['--impersonate', 'chrome'];
+  const cookiesFile = process.env.TIKTOK_COOKIES_FILE;
+  if (cookiesFile) {
+    if (!fs.existsSync(cookiesFile)) {
+      throw new Error(`TIKTOK_COOKIES_FILE points to a missing file: ${cookiesFile}`);
+    }
+    args.push('--cookies', cookiesFile);
+  }
+  return args;
+}
+
+function formatSize(size?: number): string {
+  if (!size || !Number.isFinite(size)) return 'Varies';
+  if (size < 1024 * 1024) return `${Math.max(1, Math.round(size / 1024))} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function getQualityDimension(format: any, isPortrait: boolean): number {
+  return Number(isPortrait ? format.width : format.height) || 0;
+}
 
 dotenv.config();
 
@@ -414,7 +504,15 @@ app.get('/api/stream-download', async (req, res) => {
     return res.status(400).send('Missing url parameter');
   }
 
-  const meta = await extractMetadataFromUrl(url);
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    return res.status(400).send('Enter a valid http or https media URL.');
+  }
+  if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+    return res.status(400).send('Only http and https media URLs are supported.');
+  }
   const isAudio = formatId.includes('audio') || formatId === 'mp3';
   const isImage = formatId.includes('thumb') || formatId === 'image';
 
@@ -424,11 +522,19 @@ app.get('/api/stream-download', async (req, res) => {
     cleanFilename += ext;
   }
 
+  let sourceInfo: any;
+  try {
+    sourceInfo = await getYtDlpInfo(url);
+  } catch (error: any) {
+    return res.status(502).send(error.message || 'Could not inspect the source media.');
+  }
+
   // Handle Cover Image
   if (isImage) {
     try {
-      if (meta.thumbnail && meta.thumbnail.startsWith('http')) {
-        const imgResp = await fetch(meta.thumbnail, {
+      const thumbnailUrl = sourceInfo.thumbnail;
+      if (thumbnailUrl && /^https?:\/\//i.test(thumbnailUrl)) {
+        const imgResp = await fetch(thumbnailUrl, {
           headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
           }
@@ -443,170 +549,65 @@ app.get('/api/stream-download', async (req, res) => {
     } catch (e) {
       console.warn('Image fetch failed:', e);
     }
-    const safeFallbackImg = path.join(MEDIA_DIR, 'nature.jpg');
-    return res.download(safeFallbackImg, cleanFilename);
+    return res.status(502).send('Could not fetch the source thumbnail. No substitute image was downloaded.');
   }
 
-  const tmpDir = '/tmp/downloads';
+  const tmpDir = path.join(os.tmpdir(), 'fast-downloader');
   if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
   const uniqueId = Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 6);
-  const outPath = path.join(tmpDir, `dl_${uniqueId}${ext}`);
-
   try {
-    // Case 1: Direct media link exists (e.g. mp4, webm, mov, or extracted video stream)
-    if (meta.directSourceUrl) {
-      if (isAudio) {
-        await execFileAsync('ffmpeg', [
-          '-y',
-          '-i', meta.directSourceUrl,
-          '-vn',
-          '-b:a', '320k',
-          '-metadata', `title=${meta.title}`,
-          '-metadata', `artist=${meta.author.name}`,
-          outPath
-        ], { timeout: 35000 });
-      } else {
-        let scaleFilter = 'scale=1920:1080:force_original_aspect_ratio=decrease';
-        if (formatId === '2160p') scaleFilter = 'scale=3840:2160:force_original_aspect_ratio=decrease';
-        else if (formatId === '720p') scaleFilter = 'scale=1280:720:force_original_aspect_ratio=decrease';
-        else if (formatId === '480p') scaleFilter = 'scale=854:480:force_original_aspect_ratio=decrease';
-
-        await execFileAsync('ffmpeg', [
-          '-y',
-          '-i', meta.directSourceUrl,
-          '-vf', scaleFilter,
-          '-c:v', 'libx264',
-          '-preset', 'ultrafast',
-          '-c:a', 'aac',
-          '-b:a', '192k',
-          '-movflags', '+faststart',
-          '-metadata', `title=${meta.title}`,
-          '-metadata', `artist=${meta.author.name}`,
-          outPath
-        ], { timeout: 45000 });
-      }
-
-      if (fs.existsSync(outPath) && fs.statSync(outPath).size > 1000) {
-        return res.download(outPath, cleanFilename, () => {
-          try { fs.unlinkSync(outPath); } catch {}
-        });
-      }
-    }
-
-    // Case 2: Try yt-dlp to download the real stream from platforms
+    // Case 2: Download the actual selected source with yt-dlp.
     const rawDlTemplate = path.join(tmpDir, `raw_${uniqueId}.%(ext)s`);
-    let ytdlSuccess = false;
-    try {
-      await execFileAsync('/app/applet/bin/yt-dlp', [
-        '-o', rawDlTemplate,
-        '--no-playlist',
-        '-f', isAudio ? 'bestaudio/best' : 'best[height<=1080]/best',
-        url
-      ], { timeout: 30000 });
+    const requestedHeight = formatId.match(/^(\d{3,4})p?$/)?.[1];
+    const sourceVideoFormats = (sourceInfo.formats || []).filter((format: any) =>
+      format.vcodec && format.vcodec !== 'none' && Number.isFinite(Number(format.width)) && Number.isFinite(Number(format.height))
+    );
+    const bestSourceFormat = sourceVideoFormats.length
+      ? sourceVideoFormats.reduce((best: any, current: any) =>
+          Number(current.width) * Number(current.height) > Number(best.width) * Number(best.height) ? current : best
+        )
+      : undefined;
+    const isPortrait = Boolean(bestSourceFormat && Number(bestSourceFormat.width) < Number(bestSourceFormat.height));
+    const dimensionField = isPortrait ? 'width' : 'height';
+    const formatSelector = isAudio
+      ? 'bestaudio/best'
+      : requestedHeight
+        ? `bestvideo[${dimensionField}<=${requestedHeight}]+bestaudio/best[${dimensionField}<=${requestedHeight}]`
+        : 'bestvideo+bestaudio/best';
+    const ytdlpArgs = [
+      '--no-playlist', '--no-warnings', '--no-part',
+      '-f', formatSelector,
+      '-o', rawDlTemplate,
+      ...getPlatformYtDlpArgs(url)
+    ];
+    if (isAudio) ytdlpArgs.push('--extract-audio', '--audio-format', 'mp3');
+    else ytdlpArgs.push('--merge-output-format', 'mp4', '--remux-video', 'mp4');
+    ytdlpArgs.push(url);
 
-      const files = fs.readdirSync(tmpDir).filter(f => f.startsWith(`raw_${uniqueId}`));
-      if (files.length > 0) {
-        const downloadedRaw = path.join(tmpDir, files[0]);
-        if (isAudio) {
-          await execFileAsync('ffmpeg', [
-            '-y',
-            '-i', downloadedRaw,
-            '-vn',
-            '-b:a', '320k',
-            '-metadata', `title=${meta.title}`,
-            '-metadata', `artist=${meta.author.name}`,
-            outPath
-          ]);
-        } else {
-          await execFileAsync('ffmpeg', [
-            '-y',
-            '-i', downloadedRaw,
-            '-c:v', 'copy',
-            '-c:a', 'aac',
-            '-movflags', '+faststart',
-            '-metadata', `title=${meta.title}`,
-            '-metadata', `artist=${meta.author.name}`,
-            outPath
-          ]);
-        }
-        try { fs.unlinkSync(downloadedRaw); } catch {}
-        ytdlSuccess = fs.existsSync(outPath) && fs.statSync(outPath).size > 1000;
-      }
-    } catch {
-      // yt-dlp blocked
+    await runYtDlp(ytdlpArgs, 120000);
+    const downloadedFiles = fs.readdirSync(tmpDir).filter(file => file.startsWith(`raw_${uniqueId}.`));
+    const expectedExtension = isAudio ? '.mp3' : '.mp4';
+    const selectedFile = downloadedFiles.find(file => path.extname(file).toLowerCase() === expectedExtension) || downloadedFiles[0];
+    const downloadedPath = selectedFile ? path.join(tmpDir, selectedFile) : '';
+    if (!downloadedPath || !fs.existsSync(downloadedPath) || fs.statSync(downloadedPath).size < 1024) {
+      throw new Error('The platform returned no usable video file.');
     }
 
-    if (ytdlSuccess) {
-      return res.download(outPath, cleanFilename, () => {
-        try { fs.unlinkSync(outPath); } catch {}
-      });
-    }
+    const actualExtension = path.extname(downloadedPath) || ext;
+    const actualFilename = rawFilename.toLowerCase().endsWith(actualExtension)
+      ? cleanFilename
+      : `${cleanFilename.replace(/\.[^.]+$/, '')}${actualExtension}`;
+    res.setHeader('Content-Type', actualExtension === '.mp3' ? 'audio/mpeg' : actualExtension === '.webm' ? 'video/webm' : 'video/mp4');
+    return res.download(downloadedPath, actualFilename, () => {
+      try { fs.unlinkSync(downloadedPath); } catch {}
+    });
 
-    // Case 3: When platform blocks raw server extraction, generate customized real video file with real poster & metadata
-    let localThumb = path.join(tmpDir, `thumb_${uniqueId}.jpg`);
-    let thumbOk = false;
-    try {
-      if (meta.thumbnail && meta.thumbnail.startsWith('http')) {
-        const resp = await fetch(meta.thumbnail, {
-          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
-        });
-        if (resp.ok) {
-          const buf = await resp.arrayBuffer();
-          fs.writeFileSync(localThumb, Buffer.from(buf));
-          thumbOk = true;
-        }
-      }
-    } catch {}
-
-    if (!thumbOk) {
-      localThumb = path.join(MEDIA_DIR, meta.platform === 'tiktok' ? 'street.jpg' : 'nature.jpg');
-    }
-
-    if (isAudio) {
-      const baseAudio = path.join(MEDIA_DIR, meta.platform === 'tiktok' ? 'audio_street.mp3' : 'audio_sample.mp3');
-      await execFileAsync('ffmpeg', [
-        '-y',
-        '-i', baseAudio,
-        '-b:a', '320k',
-        '-metadata', `title=${meta.title}`,
-        '-metadata', `artist=${meta.author.name}`,
-        outPath
-      ]);
-    } else {
-      const durationSec = Math.min(Math.max(meta.duration || 15, 10), 30);
-      await execFileAsync('ffmpeg', [
-        '-y',
-        '-loop', '1',
-        '-i', localThumb,
-        '-f', 'lavfi',
-        '-i', 'anullsrc=r=44100:cl=stereo',
-        '-c:v', 'libx264',
-        '-t', `${durationSec}`,
-        '-pix_fmt', 'yuv420p',
-        '-preset', 'ultrafast',
-        '-movflags', '+faststart',
-        '-metadata', `title=${meta.title}`,
-        '-metadata', `artist=${meta.author.name}`,
-        outPath
-      ]);
-    }
-
-    if (thumbOk && localThumb.startsWith('/tmp/')) {
-      try { fs.unlinkSync(localThumb); } catch {}
-    }
-
-    if (fs.existsSync(outPath) && fs.statSync(outPath).size > 1000) {
-      return res.download(outPath, cleanFilename, () => {
-        try { fs.unlinkSync(outPath); } catch {}
-      });
-    }
   } catch (err: any) {
     console.error('Download stream error:', err.message);
+    if (!res.headersSent) {
+      return res.status(502).send(err.message || 'Could not download the requested source media.');
+    }
   }
-
-  // Safe fallback
-  const fallbackFile = isAudio ? 'audio_sample.mp3' : 'nature_1080p.mp4';
-  return res.download(path.join(MEDIA_DIR, fallbackFile), cleanFilename);
 });
 
 // API: Stream Proxy for Direct Media
@@ -629,8 +630,7 @@ app.get('/api/proxy-media', async (req, res) => {
     clearTimeout(timeout);
 
     if (!upstream.ok || !upstream.body) {
-      const safeFallback = path.join(MEDIA_DIR, 'nature_1080p.mp4');
-      return res.download(safeFallback, customFilename);
+      return res.status(upstream.status || 502).send('The source media could not be fetched.');
     }
 
     const contentType = upstream.headers.get('content-type') || 'video/mp4';
@@ -648,11 +648,7 @@ app.get('/api/proxy-media', async (req, res) => {
     res.end();
   } catch (err: any) {
     console.error('Proxy media error:', err.message);
-    const safeFallback = path.join(MEDIA_DIR, 'nature_1080p.mp4');
-    if (fs.existsSync(safeFallback)) {
-      return res.download(safeFallback, (req.query.filename as string) || 'OmniSave_Media.mp4');
-    }
-    res.status(500).send('Error streaming media');
+    if (!res.headersSent) res.status(502).send(err.message || 'Error streaming source media.');
   }
 });
 
@@ -704,131 +700,101 @@ app.post('/api/resolve', async (req, res) => {
     }
 
     const trimmedUrl = url.trim();
-    const meta = await extractMetadataFromUrl(trimmedUrl);
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(trimmedUrl);
+    } catch {
+      return res.status(400).json({ error: 'Enter a valid http or https video URL.' });
+    }
+    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+      return res.status(400).json({ error: 'Only http and https video links are supported.' });
+    }
+
+    const [meta, info] = await Promise.all([
+      extractMetadataFromUrl(trimmedUrl),
+      getYtDlpInfo(trimmedUrl)
+    ]);
+    const extractedVideoFormats = (info.formats || []).filter((format: any) =>
+      format.vcodec && format.vcodec !== 'none' && Number.isFinite(Number(format.width)) && Number.isFinite(Number(format.height))
+    );
+    if (!extractedVideoFormats.length) {
+      return res.status(422).json({ error: 'No downloadable video stream was found at this URL.' });
+    }
+
+    meta.title = info.title || meta.title;
+    meta.duration = Number(info.duration) || meta.duration;
+    meta.durationFormatted = `${String(Math.floor(meta.duration / 60)).padStart(2, '0')}:${String(Math.floor(meta.duration % 60)).padStart(2, '0')}`;
+    meta.thumbnail = info.thumbnail || meta.thumbnail;
+    meta.author = {
+      ...meta.author,
+      name: info.uploader || info.channel || meta.author.name,
+      handle: info.uploader_id ? `@${info.uploader_id}` : meta.author.handle
+    };
+    meta.caption = info.description || meta.caption;
+    meta.stats = undefined;
+    meta.previewVideoUrl = undefined;
     const safeTitleSlug = meta.title.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 32);
 
-    const isVertical = meta.platform === 'tiktok' || meta.platform === 'threads' || trimmedUrl.includes('reel') || trimmedUrl.includes('short');
-
     const formats: MediaFormat[] = [];
+    const highestByArea = extractedVideoFormats.reduce((best: any, current: any) =>
+      Number(current.width) * Number(current.height) > Number(best.width) * Number(best.height) ? current : best
+    );
+    const isPortrait = Number(highestByArea.width) < Number(highestByArea.height);
+    const highestDimension = getQualityDimension(highestByArea, isPortrait);
+    const highestFormat = extractedVideoFormats.reduce((best: any, current: any) =>
+      getQualityDimension(current, isPortrait) > getQualityDimension(best, isPortrait) ? current : best
+    );
+    formats.push({
+      id: 'source-original', quality: 'Original Source',
+      resolution: `${highestFormat.width || '?'}x${highestFormat.height}`,
+      format: 'mp4', type: 'video',
+      sizeBytes: Number(highestFormat.filesize || highestFormat.filesize_approx) || 0,
+      sizeFormatted: formatSize(Number(highestFormat.filesize || highestFormat.filesize_approx)),
+      fps: Number(highestFormat.fps) || undefined, hasAudio: true,
+      bitrate: 'Original',
+      downloadUrl: `/api/stream-download?url=${encodeURIComponent(trimmedUrl)}&format=source-original&filename=${encodeURIComponent(`OmniSave_Original_${safeTitleSlug}.mp4`)}`
+    });
 
-    // If a direct upstream video URL was extracted, provide that as top priority master format
-    if (meta.directSourceUrl) {
+    const addedDimensions = new Set<number>();
+    for (const height of [2160, 1080, 720, 480]) {
+      const candidates = extractedVideoFormats.filter((format: any) => getQualityDimension(format, isPortrait) <= height);
+      if (!candidates.length) continue;
+      const selected = candidates.reduce((best: any, current: any) =>
+        getQualityDimension(current, isPortrait) > getQualityDimension(best, isPortrait) ? current : best
+      );
+      const selectedDimension = getQualityDimension(selected, isPortrait);
+      if (selectedDimension === highestDimension || addedDimensions.has(selectedDimension)) continue;
+      addedDimensions.add(selectedDimension);
       formats.push({
-        id: 'source-original',
-        quality: 'Original Master Stream',
-        resolution: 'Direct Source',
-        format: 'mp4',
-        type: 'video',
-        sizeBytes: 18500000,
-        sizeFormatted: '18.5 MB',
-        fps: 60,
-        hasAudio: true,
-        bitrate: 'Original',
-        downloadUrl: `/api/stream-download?url=${encodeURIComponent(trimmedUrl)}&format=source-original&filename=${encodeURIComponent(`OmniSave_Original_${safeTitleSlug}.mp4`)}`
+        id: `${selectedDimension}p`, quality: `${selectedDimension}p`,
+        resolution: `${selected.width || '?'}x${selected.height}`,
+        format: 'mp4', type: 'video',
+        sizeBytes: Number(selected.filesize || selected.filesize_approx) || 0,
+        sizeFormatted: formatSize(Number(selected.filesize || selected.filesize_approx)),
+        fps: Number(selected.fps) || undefined, hasAudio: true,
+        downloadUrl: `/api/stream-download?url=${encodeURIComponent(trimmedUrl)}&format=${selectedDimension}p&filename=${encodeURIComponent(`OmniSave_${selectedDimension}p_${safeTitleSlug}.mp4`)}`
       });
     }
 
-    formats.push(
-      {
-        id: '2160p',
-        quality: '4K Ultra HD',
-        resolution: isVertical ? '2160x3840' : '3840x2160',
-        format: 'mp4',
-        type: 'video',
-        sizeBytes: 1567000,
-        sizeFormatted: '1.5 MB',
-        fps: 60,
-        hasAudio: true,
-        bitrate: '18 Mbps',
-        downloadUrl: `/api/stream-download?url=${encodeURIComponent(trimmedUrl)}&format=2160p&filename=${encodeURIComponent(`OmniSave_4K_${safeTitleSlug}.mp4`)}`
-      },
-      {
-        id: '1080p',
-        quality: '1080p Full HD',
-        resolution: isVertical ? '1080x1920' : '1920x1080',
-        format: 'mp4',
-        type: 'video',
-        sizeBytes: isVertical ? 1105000 : 358000,
-        sizeFormatted: isVertical ? '1.1 MB' : '358 KB',
-        fps: 60,
-        hasAudio: true,
-        bitrate: '8 Mbps',
-        downloadUrl: `/api/stream-download?url=${encodeURIComponent(trimmedUrl)}&format=1080p&filename=${encodeURIComponent(`OmniSave_1080p_${safeTitleSlug}.mp4`)}`
-      },
-      {
-        id: '720p',
-        quality: '720p HD',
-        resolution: isVertical ? '720x1280' : '1280x720',
-        format: 'mp4',
-        type: 'video',
-        sizeBytes: 514000,
-        sizeFormatted: '514 KB',
-        fps: 30,
-        hasAudio: true,
-        bitrate: '4 Mbps',
-        downloadUrl: `/api/stream-download?url=${encodeURIComponent(trimmedUrl)}&format=720p&filename=${encodeURIComponent(`OmniSave_720p_${safeTitleSlug}.mp4`)}`
-      },
-      {
-        id: '480p',
-        quality: '480p SD',
-        resolution: isVertical ? '480x854' : '854x480',
-        format: 'mp4',
-        type: 'video',
-        sizeBytes: 263000,
-        sizeFormatted: '263 KB',
-        fps: 30,
-        hasAudio: true,
-        bitrate: '2 Mbps',
-        downloadUrl: `/api/stream-download?url=${encodeURIComponent(trimmedUrl)}&format=480p&filename=${encodeURIComponent(`OmniSave_480p_${safeTitleSlug}.mp4`)}`
-      },
-      {
-        id: 'audio-mp3',
-        quality: 'Audio Only (MP3)',
-        resolution: '320 kbps Studio',
-        format: 'mp3',
-        type: 'audio',
-        sizeBytes: 202000,
-        sizeFormatted: '202 KB',
-        hasAudio: true,
-        bitrate: '320 kbps',
+    if ((info.formats || []).some((format: any) => format.acodec && format.acodec !== 'none')) {
+      formats.push({
+        id: 'audio-mp3', quality: 'Audio Only (MP3)', resolution: 'Source audio',
+        format: 'mp3', type: 'audio', sizeBytes: 0, sizeFormatted: 'Varies',
+        hasAudio: true, bitrate: 'Source quality',
         downloadUrl: `/api/stream-download?url=${encodeURIComponent(trimmedUrl)}&format=audio-mp3&filename=${encodeURIComponent(`OmniSave_Audio_${safeTitleSlug}.mp3`)}`
-      },
-      {
-        id: 'thumb-hd',
-        quality: 'Original Master Image',
-        resolution: '1920x1080',
-        format: 'jpg',
-        type: 'image',
-        sizeBytes: 813000,
-        sizeFormatted: '813 KB',
-        hasAudio: false,
-        downloadUrl: `/api/stream-download?url=${encodeURIComponent(trimmedUrl)}&format=thumb-hd&filename=${encodeURIComponent(`OmniSave_Cover_${safeTitleSlug}.jpg`)}`
-      }
-    );
-
-    let carouselItems = meta.carouselItems;
-    if (meta.platform === 'pinterest' || trimmedUrl.includes('carousel')) {
-      carouselItems = [
-        {
-          id: 'slide_1',
-          type: 'image',
-          previewUrl: meta.thumbnail || '/media/nature.jpg',
-          downloadUrl: `/api/download-file?file=nature.jpg&filename=slide_01.jpg`,
-          width: 1920,
-          height: 1080
-        },
-        {
-          id: 'slide_2',
-          type: 'image',
-          previewUrl: '/media/street.jpg',
-          downloadUrl: `/api/download-file?file=street.jpg&filename=slide_02.jpg`,
-          width: 1080,
-          height: 1920
-        }
-      ];
+      });
     }
 
-    const video1080pFile = isVertical ? 'street_1080p.mp4' : 'nature_1080p.mp4';
+    if (meta.thumbnail && /^https?:\/\//i.test(meta.thumbnail)) {
+      formats.push({
+        id: 'thumb-hd', quality: 'Source Thumbnail', resolution: 'Original',
+        format: 'jpg', type: 'image', sizeBytes: 0, sizeFormatted: 'Original size',
+        hasAudio: false,
+        downloadUrl: `/api/stream-download?url=${encodeURIComponent(trimmedUrl)}&format=thumb-hd&filename=${encodeURIComponent(`OmniSave_Cover_${safeTitleSlug}.jpg`)}`
+      });
+    }
+
+    let carouselItems = meta.carouselItems;
 
     const resultItem: MediaItem = {
       id: 'media_' + Date.now().toString(36),
@@ -849,7 +815,7 @@ app.post('/api/resolve', async (req, res) => {
       watermarkRemoved: Boolean(removeWatermark),
       embedUrl: meta.embedUrl,
       directSourceUrl: meta.directSourceUrl,
-      previewVideoUrl: meta.previewVideoUrl || `/media/${video1080pFile}`,
+      previewVideoUrl: meta.previewVideoUrl,
       resolvedAt: new Date().toISOString()
     };
 
@@ -870,10 +836,43 @@ app.post('/api/batch-resolve', async (req, res) => {
 
     const cleanUrls = urls.map(u => String(u).trim()).filter(Boolean).slice(0, 20);
     const results = await Promise.all(cleanUrls.map(async (urlStr, index) => {
-      const meta = await extractMetadataFromUrl(urlStr);
+      const [meta, info] = await Promise.all([extractMetadataFromUrl(urlStr), getYtDlpInfo(urlStr)]);
+      const availableVideoFormats = (info.formats || []).filter((format: any) =>
+        format.vcodec && format.vcodec !== 'none' && Number.isFinite(Number(format.height))
+      );
+      if (!availableVideoFormats.length) throw new Error(`No downloadable video stream found for ${urlStr}`);
+      meta.title = info.title || meta.title;
+      meta.duration = Number(info.duration) || meta.duration;
+      meta.thumbnail = info.thumbnail || meta.thumbnail;
+      meta.author.name = info.uploader || info.channel || meta.author.name;
+      meta.stats = undefined;
+      meta.previewVideoUrl = undefined;
       const safeTitleSlug = meta.title.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 28);
-      const isReel = meta.platform === 'tiktok' || urlStr.includes('reel') || urlStr.includes('short');
-      const vidFile = isReel ? 'street_1080p.mp4' : 'nature_1080p.mp4';
+      const maxHeight = Math.max(...availableVideoFormats.map((format: any) => Number(format.height)));
+      const max1080 = availableVideoFormats.filter((format: any) => Number(format.height) <= 1080);
+      const formats: MediaFormat[] = [{
+        id: 'source-original', quality: 'Original Source',
+        resolution: `${availableVideoFormats.find((format: any) => Number(format.height) === maxHeight)?.width || '?'}x${maxHeight}`,
+        format: 'mp4', type: 'video', sizeBytes: 0, sizeFormatted: 'Varies', hasAudio: true,
+        downloadUrl: `/api/stream-download?url=${encodeURIComponent(urlStr)}&format=source-original&filename=${encodeURIComponent(`OmniSave_${safeTitleSlug}.mp4`)}`
+      }];
+      if (max1080.length) {
+        const actual = max1080.reduce((best: any, current: any) => Number(current.height) > Number(best.height) ? current : best);
+        formats.push({
+          id: '1080p', quality: 'Up to 1080p', resolution: `${actual.width || '?'}x${actual.height}`,
+          format: 'mp4', type: 'video', sizeBytes: Number(actual.filesize || actual.filesize_approx) || 0,
+          sizeFormatted: formatSize(Number(actual.filesize || actual.filesize_approx)), fps: Number(actual.fps) || undefined,
+          hasAudio: true,
+          downloadUrl: `/api/stream-download?url=${encodeURIComponent(urlStr)}&format=1080p&filename=${encodeURIComponent(`OmniSave_${safeTitleSlug}.mp4`)}`
+        });
+      }
+      if ((info.formats || []).some((format: any) => format.acodec && format.acodec !== 'none')) {
+        formats.push({
+          id: 'audio-mp3', quality: 'Audio Only (MP3)', resolution: 'Source audio',
+          format: 'mp3', type: 'audio', sizeBytes: 0, sizeFormatted: 'Varies', hasAudio: true,
+          downloadUrl: `/api/stream-download?url=${encodeURIComponent(urlStr)}&format=audio-mp3&filename=${encodeURIComponent(`OmniSave_${safeTitleSlug}.mp3`)}`
+        });
+      }
 
       const item: MediaItem = {
         id: `batch_${Date.now()}_${index}`,
@@ -886,37 +885,13 @@ app.post('/api/batch-resolve', async (req, res) => {
         duration: meta.duration,
         durationFormatted: meta.durationFormatted,
         mediaType: meta.mediaType,
-        formats: [
-          {
-            id: '1080p',
-            quality: '1080p Full HD',
-            resolution: isReel ? '1080x1920' : '1920x1080',
-            format: 'mp4',
-            type: 'video',
-            sizeBytes: isReel ? 1105000 : 358000,
-            sizeFormatted: isReel ? '1.1 MB' : '358 KB',
-            fps: 60,
-            hasAudio: true,
-            downloadUrl: `/api/stream-download?url=${encodeURIComponent(urlStr)}&format=1080p&filename=${encodeURIComponent(`OmniSave_${safeTitleSlug}.mp4`)}`
-          },
-          {
-            id: 'audio-mp3',
-            quality: 'Audio Only (MP3)',
-            resolution: '320 kbps',
-            format: 'mp3',
-            type: 'audio',
-            sizeBytes: 202000,
-            sizeFormatted: '202 KB',
-            hasAudio: true,
-            downloadUrl: `/api/stream-download?url=${encodeURIComponent(urlStr)}&format=audio-mp3&filename=${encodeURIComponent(`OmniSave_${safeTitleSlug}.mp3`)}`
-          }
-        ],
+        formats,
         caption: meta.caption,
         tags: meta.tags,
         watermarkRemoved: Boolean(removeWatermark),
         embedUrl: meta.embedUrl,
         directSourceUrl: meta.directSourceUrl,
-        previewVideoUrl: meta.previewVideoUrl || `/media/${vidFile}`,
+        previewVideoUrl: meta.previewVideoUrl,
         resolvedAt: new Date().toISOString()
       };
 

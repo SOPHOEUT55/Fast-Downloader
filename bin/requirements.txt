@@ -1,0 +1,2 @@
+# Enables yt-dlp browser impersonation for TikTok webpage requests.
+curl-cffi>=0.16.3
