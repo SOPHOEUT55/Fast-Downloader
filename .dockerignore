@@ -1,0 +1,17 @@
+node_modules/
+.git/
+.env
+.env.*
+!.env.example
+
+dist/
+coverage/
+*.log
+
+tools/Python312/
+
+.vscode/
+.idea/
+
+.DS_Store
+Thumbs.db
