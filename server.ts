@@ -8,6 +8,32 @@ import { execFile } from 'child_process';
 import util from 'util';
 
 const execFileAsync = util.promisify(execFile);
+let youtubeCookiesTempDir: string | undefined;
+
+function getCookiesFile(fileEnvName: string, base64EnvName?: string): string | undefined {
+  const configuredPath = process.env[fileEnvName];
+  if (configuredPath) {
+    if (!fs.existsSync(configuredPath)) {
+      throw new Error(`${fileEnvName} points to a missing file: ${configuredPath}`);
+    }
+    return configuredPath;
+  }
+
+  const encodedCookies = base64EnvName ? process.env[base64EnvName] : undefined;
+  if (!encodedCookies) return undefined;
+
+  const cookies = Buffer.from(encodedCookies, 'base64');
+  if (!cookies.length) {
+    throw new Error(`${base64EnvName} does not contain valid cookie data.`);
+  }
+
+  youtubeCookiesTempDir ??= fs.mkdtempSync(path.join(os.tmpdir(), 'fast-downloader-youtube-'));
+  const cookiesPath = path.join(youtubeCookiesTempDir, 'cookies.txt');
+  if (!fs.existsSync(cookiesPath)) {
+    fs.writeFileSync(cookiesPath, cookies, { mode: 0o600 });
+  }
+  return cookiesPath;
+}
 
 function getYtDlpCommand(): { command: string; prefixArgs: string[] } {
   const configuredPath = process.env.YTDLP_BIN;
@@ -72,21 +98,27 @@ async function getYtDlpInfo(url: string): Promise<any> {
 
 function getPlatformYtDlpArgs(url: string): string[] {
   let isTikTok = false;
+  let isYouTube = false;
   try {
-    isTikTok = new URL(url).hostname.toLowerCase().endsWith('tiktok.com');
+    const hostname = new URL(url).hostname.toLowerCase();
+    isTikTok = hostname === 'tiktok.com' || hostname.endsWith('.tiktok.com');
+    isYouTube = hostname === 'youtu.be' || hostname === 'youtube.com' || hostname.endsWith('.youtube.com');
   } catch {
     return [];
   }
-  if (!isTikTok) return [];
 
-  const args = ['--impersonate', 'chrome'];
-  const cookiesFile = process.env.TIKTOK_COOKIES_FILE;
-  if (cookiesFile) {
-    if (!fs.existsSync(cookiesFile)) {
-      throw new Error(`TIKTOK_COOKIES_FILE points to a missing file: ${cookiesFile}`);
-    }
-    args.push('--cookies', cookiesFile);
+  const args: string[] = [];
+  if (isTikTok) {
+    args.push('--impersonate', 'chrome');
+    const cookiesFile = getCookiesFile('TIKTOK_COOKIES_FILE');
+    if (cookiesFile) args.push('--cookies', cookiesFile);
   }
+
+  if (isYouTube) {
+    const cookiesFile = getCookiesFile('YOUTUBE_COOKIES_FILE', 'YOUTUBE_COOKIES_B64');
+    if (cookiesFile) args.push('--cookies', cookiesFile);
+  }
+
   return args;
 }
 
