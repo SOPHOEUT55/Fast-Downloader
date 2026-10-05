@@ -18,9 +18,11 @@ function getYtDlpCommand(): { command: string; prefixArgs: string[] } {
     return { command: configuredPath, prefixArgs: [] };
   }
 
-  const nativePath = path.join(__dirname, 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
-  if (fs.existsSync(nativePath) && (process.platform !== 'win32' || nativePath.endsWith('.exe'))) {
-    return { command: nativePath, prefixArgs: [] };
+  if (process.platform === 'win32') {
+    const nativePath = path.join(__dirname, 'bin', 'yt-dlp.exe');
+    if (fs.existsSync(nativePath)) {
+      return { command: nativePath, prefixArgs: [] };
+    }
   }
 
   const bundledScript = path.join(__dirname, 'bin', 'yt-dlp');

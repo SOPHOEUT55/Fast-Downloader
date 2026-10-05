@@ -20,6 +20,9 @@ RUN npm ci
 # Copy application
 COPY . .
 
+# Ensure the bundled downloader is executable in the Linux image.
+RUN chmod 755 /app/bin/yt-dlp
+
 # Install yt-dlp Python dependency for TikTok browser impersonation
 RUN python3 -m pip install \
     --break-system-packages \
