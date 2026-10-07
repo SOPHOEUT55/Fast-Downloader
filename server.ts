@@ -9,6 +9,7 @@ import util from 'util';
 
 const execFileAsync = util.promisify(execFile);
 let youtubeCookiesTempDir: string | undefined;
+let tikTokImpersonationTarget: Promise<string> | undefined;
 
 function getCookiesFile(
   fileEnvName: string,
@@ -62,7 +63,9 @@ function getYtDlpCommand(): { command: string; prefixArgs: string[] } {
   const bundledScript = path.join(__dirname, 'bin', 'yt-dlp');
   if (fs.existsSync(bundledScript)) {
     if (process.platform === 'win32') {
-      return { command: process.env.PYTHON || 'python', prefixArgs: [bundledScript] };
+      const bundledPython = path.join(__dirname, 'tools', 'Python312', 'python.exe');
+      const python = process.env.PYTHON || (fs.existsSync(bundledPython) ? bundledPython : 'python');
+      return { command: python, prefixArgs: [bundledScript] };
     }
     return { command: process.env.PYTHON || 'python3', prefixArgs: [bundledScript] };
   }
@@ -100,10 +103,35 @@ async function runYtDlp(args: string[], timeout = 60000): Promise<{ stdout: stri
   }
 }
 
+async function getTikTokImpersonationTarget(): Promise<string> {
+  tikTokImpersonationTarget ??= (async () => {
+    const { command, prefixArgs } = getYtDlpCommand();
+    let stdout: string;
+    try {
+      ({ stdout } = await execFileAsync(command, [...prefixArgs, '--list-impersonate-targets'], { timeout: 15000 }));
+    } catch (error: any) {
+      const detail = String(error.stderr || error.message || '').trim();
+      throw new Error(`Could not list yt-dlp impersonation targets (${command}): ${detail}`);
+    }
+
+    const targets = stdout.split(/\r?\n/)
+      .map(line => line.match(/^\s*(Chrome(?:-\d+)?)\s+(\S+)\s+curl_cffi\s*$/i))
+      .filter((match): match is RegExpMatchArray => Boolean(match && match[2] !== '-'))
+      .map(match => `${match[1].toLowerCase()}:${match[2].toLowerCase()}`);
+    const target = targets.find(candidate => candidate.endsWith(':windows-10')) || targets[0];
+    if (!target) {
+      throw new Error('TikTok downloads require curl-cffi with Chrome impersonation support in the Python environment used by yt-dlp. Install the packages in bin/requirements.txt or set PYTHON to an environment that has them.');
+    }
+    return target;
+  })();
+
+  return tikTokImpersonationTarget;
+}
+
 async function getYtDlpInfo(url: string): Promise<any> {
   const { stdout } = await runYtDlp([
     '--dump-single-json', '--no-warnings', '--no-playlist', '--skip-download',
-    ...getPlatformYtDlpArgs(url), url
+    ...await getPlatformYtDlpArgs(url), url
   ]);
   try {
     return JSON.parse(stdout);
@@ -112,7 +140,7 @@ async function getYtDlpInfo(url: string): Promise<any> {
   }
 }
 
-function getPlatformYtDlpArgs(url: string): string[] {
+async function getPlatformYtDlpArgs(url: string): Promise<string[]> {
   let isTikTok = false;
   let isYouTube = false;
   try {
@@ -125,7 +153,7 @@ function getPlatformYtDlpArgs(url: string): string[] {
 
   const args: string[] = [];
   if (isTikTok) {
-    args.push('--impersonate', 'chrome');
+    args.push('--impersonate', await getTikTokImpersonationTarget());
     const cookiesFile = getCookiesFile('TIKTOK_COOKIES_FILE');
     if (cookiesFile) args.push('--cookies', cookiesFile);
   }
@@ -628,7 +656,7 @@ app.get('/api/stream-download', async (req, res) => {
       '--no-playlist', '--no-warnings', '--no-part',
       '-f', formatSelector,
       '-o', rawDlTemplate,
-      ...getPlatformYtDlpArgs(url)
+      ...await getPlatformYtDlpArgs(url)
     ];
     if (isAudio) ytdlpArgs.push('--extract-audio', '--audio-format', 'mp3');
     else ytdlpArgs.push('--merge-output-format', 'mp4', '--remux-video', 'mp4');
